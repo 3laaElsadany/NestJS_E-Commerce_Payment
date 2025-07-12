@@ -79,8 +79,8 @@ src/
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/3laaElsadany/NestJS_E-Commerce_Payment_Gateway.git
-cd NestJS_E-Commerce_Payment_Gateway
+git clone https://github.com/3laaElsadany/NestJS_E-Commerce_Payment.git
+cd NestJS_E-Commerce_Payment
 npm install
 ```
 
