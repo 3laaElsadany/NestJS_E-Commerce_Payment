@@ -29,11 +29,7 @@ export class StripeService {
     this.stripe = new Stripe(this.configService.get('STRIPE_SECRET_KEY'));
   }
 
-
   async createStripe(orderData: CreateStripeDto, token: string): Promise<CreatePayment> {
-
-    const host = this.configService.get('HOST');
-    const port = this.configService.get('PORT');
 
     const decodedData = await this.jwtService.verify(token);
 
@@ -67,8 +63,8 @@ export class StripeService {
         orderName: orderData.orderName
       },
       mode: 'payment',
-      success_url: `http://${host}:${port}/stripe/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `http://${host}:${port}/stripe/cancel`,
+      success_url: `${this.configService.get('BASE_URL')}/stripe/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${this.configService.get('BASE_URL')}/stripe/cancel`,
       client_reference_id: decodedData.userId,
       customer_email: decodedData.email
     });

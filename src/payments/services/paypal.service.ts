@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { Model } from 'mongoose';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -10,82 +10,97 @@ import { ProductService } from 'src/product/product.service';
 import { Product } from 'src/utils/schema/product.schema';
 import { OrderResponse, CreatePayment } from 'src/utils/types';
 
-
 @Injectable()
 export class PaypalService {
-  client: any;
+  private readonly client: paypal.core.PayPalHttpClient;
 
   constructor(
     @InjectModel(Order.name) private orderModel: Model<Order>,
     @InjectModel(Product.name) private productModel: Model<Product>,
     private jwtService: JwtService,
     private configService: ConfigService,
-    private readonly productService: ProductService
+    private readonly productService: ProductService,
   ) {
-    const environment = new paypal.core.SandboxEnvironment(
-      this.configService.get('PAYPAL_CLIENT_ID'),
-      this.configService.get('PAYPAL_SECRET_KEY')
-    );
+    const clientId = this.configService.get<string>('PAYPAL_CLIENT_ID');
+    const secret = this.configService.get<string>('PAYPAL_SECRET_KEY');
+    const mode = this.configService.get<string>('MODE');
 
+    const environment =
+      mode === 'live'
+        ? new paypal.core.LiveEnvironment(clientId, secret)
+        : new paypal.core.SandboxEnvironment(clientId, secret);
 
     this.client = new paypal.core.PayPalHttpClient(environment);
   }
 
   async createPaypal(OrderData: CreatePaypalDto, token: string): Promise<CreatePayment> {
+    const mode = this.configService.get<string>('MODE');
+    const isProd = mode === 'live';
 
-    const host = this.configService.get('HOST');
-    const port = this.configService.get('PORT');
+    const {
+      city,
+      line1,
+      line2,
+      postal_code,
+      state,
+      description,
+      quantity,
+      orderName,
+      productId,
+    } = OrderData;
 
-    const { city, line1, line2, postal_code, state, description, quantity, orderName, productId } = OrderData;
+    const decodedData = await this.jwtService.verifyAsync(token);
 
-    const decodedData = await this.jwtService.verify(token);
-
-    const product = await this.productService.getProduct(OrderData.productId) as Product;
+    const product = await this.productService.getProduct(productId);
+    if (!product) {
+      throw new BadRequestException('Product not found.');
+    }
 
     if (product.stock < quantity) {
       throw new BadRequestException('Insufficient stock for the requested quantity.');
     }
 
     const request = new paypal.orders.OrdersCreateRequest();
-    request.prefer("return=representation");
+    request.prefer('return=representation');
     request.requestBody({
-      "intent": "CAPTURE",
-      "purchase_units": [{
-        "amount": {
-          "currency_code": "USD",
-          // "currency_code": "EGP",
-          "value": (product.price * quantity).toFixed(2),
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          amount: {
+            currency_code: 'USD',
+            value: (product.price * quantity).toFixed(2),
+          },
+          description,
+          custom_id: `${decodedData.userId}::${productId}::${orderName}::${quantity}`,
+          shipping: {
+            address: {
+              address_line_1: line1,
+              address_line_2: line2,
+              admin_area_2: city,
+              admin_area_1: state,
+              postal_code: postal_code,
+              country_code: 'EG',
+            },
+          },
         },
-        description: description,
-        custom_id: `${decodedData.userId}::${productId}::${orderName}::${quantity}`,
-        "shipping": {
-          address: {
-            address_line_1: line1,
-            address_line_2: line2,
-            admin_area_2: city,
-            admin_area_1: state,
-            postal_code: postal_code,
-            country_code: "EG"
-          }
-        }
-      }],
-      "application_context": {
-        "return_url": `http://${host}:${port}/paypal/success`,
-        "cancel_url": `http://${host}:${port}/paypal/cancel`,
-        shipping_preference: "SET_PROVIDED_ADDRESS"
-      }
+      ],
+      application_context: {
+        return_url: `${this.configService.get('BASE_URL')}/paypal/success`,
+        cancel_url: `${this.configService.get('BASE_URL')}/paypal/cancel`,
+        shipping_preference: 'SET_PROVIDED_ADDRESS',
+      },
     });
 
     try {
       const order = await this.client.execute(request);
-      for (let i = 0; i < order.result.links.length; i++) {
-        if (order.result.links[i].rel === 'approve') {
-          return { paymentUrl: order.result.links[i].href };
-
-        }
+      const approveLink = order.result.links.find(link => link.rel === 'approve');
+      if (approveLink) {
+        return { paymentUrl: approveLink.href };
+      } else {
+        throw new Error('No approval link found.');
       }
     } catch (err) {
-      console.error("Error details:", err);
+      console.error('Error details:', err);
       throw new BadRequestException('Error creating PayPal order.');
     }
   }
@@ -95,50 +110,50 @@ export class PaypalService {
     captureRequest.requestBody({});
 
     try {
-
       const capture = await this.client.execute(captureRequest);
 
       const session = capture.result;
       const purchase = session.purchase_units[0];
       const payer = session.payer;
-      const shippingAddress = session.purchase_units[0].shipping.address;
-      const customIdRaw = session.purchase_units[0].payments.captures[0].custom_id;
-      const totalPrice = session.purchase_units[0].payments.captures[0].amount.value;
-      const currency = capture.result.purchase_units[0].payments.captures[0].amount.currency_code.toLowerCase();
-      let order = await this.orderModel.findOne({ sessionId: session.id });
+      const shippingAddress = purchase.shipping.address;
+      const paymentInfo = purchase.payments.captures[0];
+
+      const customIdRaw = paymentInfo.custom_id;
+      const totalPrice = paymentInfo.amount.value;
+      const currency = paymentInfo.amount.currency_code.toLowerCase();
       const [userId, productId, orderName, quantity] = customIdRaw.split('::');
 
+      let order = await this.orderModel.findOne({ sessionId: session.id });
       if (order) {
         return { message: 'Order already exists', order };
       }
 
       await this.productModel.findByIdAndUpdate(productId, {
-        $inc: { stock: -quantity }
-      })
-
+        $inc: { stock: -Number(quantity) },
+      });
 
       order = new this.orderModel({
         sessionId: session.id,
-        orderName: orderName,
+        orderName,
         email: payer.email_address,
         city: shippingAddress.admin_area_2,
         line1: shippingAddress.address_line_1,
         line2: shippingAddress.address_line_2,
         state: shippingAddress.admin_area_1,
         postalCode: shippingAddress.postal_code,
-        totalPrice: totalPrice,
-        userId: userId,
-        quantity: quantity,
+        totalPrice,
+        userId,
+        quantity,
         payed: true,
-        currency: currency,
-        productId
+        currency,
+        productId,
       });
 
       await order.save();
 
-      return { message: "Order created successfully", order };
+      return { message: 'Order created successfully', order };
     } catch (err) {
-      console.error("Capture Error", err);
+      console.error('Capture Error', err);
       throw new BadRequestException('Failed to capture order');
     }
   }
@@ -148,8 +163,12 @@ export class PaypalService {
   }
 
   async cancelOrder(sessionId: string, token: string): Promise<OrderResponse> {
-    const decodedData = await this.jwtService.verify(token);
-    const order = await this.orderModel.findOne({ sessionId, userId: decodedData.userId });
+    const decodedData = await this.jwtService.verifyAsync(token);
+    const order = await this.orderModel.findOne({
+      sessionId,
+      userId: decodedData.userId,
+    });
+
     if (!order) throw new BadRequestException('Order not found');
     if (order.status === 'cancelled') throw new BadRequestException('Order already cancelled');
 
@@ -157,7 +176,6 @@ export class PaypalService {
     const getResponse = await this.client.execute(getRequest);
 
     const captureId = getResponse.result.purchase_units[0].payments.captures[0].id;
-
     const refundRequest = new paypal.payments.CapturesRefundRequest(captureId);
     refundRequest.requestBody({});
 
@@ -169,3 +187,4 @@ export class PaypalService {
     return { message: 'Order cancelled', order };
   }
 }
+
